@@ -1,4 +1,4 @@
-# Predictive Oscillation Detector for Power Regulators
+# Predictive Oscillation Detector for Switching Power Regulators
 
 ## Overview
 
