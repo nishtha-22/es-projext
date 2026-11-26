@@ -1,313 +1,208 @@
-# Predictive Oscillation Detector for Switching Power Regulators
+# Project Handoff: Predictive Oscillation Detector for Switching Power Regulators
+
+## 1. Project overview
 
 An embedded-style monitoring pipeline for a **12 V → 5 V voltage-mode buck converter**.
-Simulated regulator waveforms are passed through an emulated ESP32 acquisition chain,
-processed window-by-window, reduced to features, scored for risk, and classified as:
 
-**`NORMAL` → `WARNING` → `OSCILLATION`**
+The system monitors output-voltage behaviour, processes sampled waveforms, extracts signal features, calculates a risk score and classifies regulator behaviour into three states:
 
-> **All data in this repository is simulated** (`buck_sim.m` → CSV → `detector.py`).
-> Nothing is measured hardware data. *Predictive* here means **early-warning detection
-> from growing trend features**, not predicting an exact time-to-failure.
+- NORMAL
+- WARNING
+- OSCILLATION
 
-```text
-REGULATOR  →  SENSE  →  ADC  →  ESP32  →  SIGNAL PROCESSING  →  FEATURES  →  RISK ASSESSMENT  →  NORMAL / WARNING / OSCILLATION
-```
+The purpose is to identify deteriorating regulator behaviour and detect growing oscillations before they become severe.
 
-In one sentence:
+**Important:** The entire current project is simulation-based. No physical buck converter, ESP32 ADC acquisition or hardware measurements have been implemented. The ESP32 acquisition chain is emulated in software.
 
-> The regulator produces a voltage → we observe it → convert it into numbers →
-> analyze those numbers → extract evidence of abnormal behavior → make a decision.
+## 2. System architecture
 
----
+REGULATOR → SENSE → ADC → ESP32 → SIGNAL PROCESSING → FEATURE EXTRACTION → RISK ASSESSMENT → STATE CLASSIFICATION
 
-## Repository layout
+The project has two main implementation components:
 
-| Path | Role |
-|------|------|
-| `buck_sim.m` | GNU Octave simulator: averaged closed-loop buck + voltage-mode PID, five scenarios |
-| `detector.py` | Python prototype of the firmware: ADC emulation → circular buffer → features → risk → state machine |
-| `data/*.csv` | Five simulated waveforms (`time_s,Vout_V,iL_A,duty,Rload_ohm`), 200 ms @ 100 kS/s |
-| `data/*.png` | Simulator plots of `Vout(t)` per scenario |
-| `results/` | Created at runtime: detector figures per scenario |
+| File | Purpose |
+|---|---|
+| `buck_sim.m` | GNU Octave simulation of the buck converter and its control-loop scenarios |
+| `detector.py` | Python prototype of the embedded monitoring and classification pipeline |
 
----
+Other directories:
+- `data/`: five simulated CSV waveforms and simulator plots.
+- `results/`: generated detector figures.
 
-## 1. Regulator
+## 3. Converter model
 
-The plant is a buck converter regulated to **5 V from 12 V** with a voltage-mode PID.
+The simulated plant is a 12 V to 5 V buck converter with voltage-mode PID regulation.
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `Vin` | 12 V | supply |
-| `Vref` | 5 V | setpoint → ideal duty `D ≈ Vref/Vin = 0.417` |
-| `fsw` | 100 kHz | switching frequency (ripple estimate only — see caveat below) |
-| `L` | 100 µH | power inductor (`RL = 0.05 Ω` DCR) |
-| `C` | 220 µF | output capacitor (ESR neglected) |
-| LC resonance `f0` | ≈ 1.07 kHz | `1/(2π√(LC))` — the band we actually watch |
-| Nominal load | 10 Ω (0.5 A) | load-current jitter 15 mA RMS as noise seed |
-| Integration | 500 kHz, 200 ms | stored every 5th step → **100 kS/s** in CSV |
+| Parameter | Value |
+|---|---:|
+| Input voltage | 12 V |
+| Reference output voltage | 5 V |
+| Switching frequency | 100 kHz |
+| Inductance | 100 µH |
+| Output capacitance | 220 µF |
+| Inductor DCR | 0.05 Ω |
+| Nominal load | 10 Ω |
+| Nominal output current | 0.5 A |
+| LC resonant frequency | Approximately 1.07 kHz |
+| Simulation duration | 200 ms |
+| Stored waveform sampling rate | 100 kS/s |
 
-The model is **averaged** (control-oriented): the switch is replaced by its duty
-`d`, so the 100 kHz switching ripple is *not* in the waveform. What remains is the
-loop dynamics — ripple, ringing, and oscillation around 5 V.
+The model is averaged rather than switching-level. It represents control-loop dynamics and does not reproduce the actual 100 kHz switching ripple.
 
-Controller: `d = Kp·e + ∫Ki·e + Kd·d/dt(e)` with filtered derivative, anti-windup,
-duty limits `[0, 0.95]`, and inductor current limits `[-0.5, 2.0] A`.
+## 4. Five simulated operating scenarios
 
-A linear sanity check (`least_damped_pole`) reports the least-damped closed-loop
-pole (frequency and damping ratio ζ) for each gain set — the code's stability
-metric in place of a measured phase margin.
+1. **Stable:** Healthy controller gains and constant load. Used as the baseline.
+2. **Transient:** Load changes from 10 Ω to 5 Ω at 50 ms and returns at 120 ms. Tests rejection of temporary disturbances.
+3. **Ringing:** Reduced derivative action and lower integral gain create poorly damped but stable behaviour.
+4. **Growing:** Controller gains gradually become marginal between 30 and 130 ms, producing deteriorating damping.
+5. **Oscillation:** Controller gains abruptly become unstable at 50 ms.
 
-### Five scenarios
+## 5. Sensing and ADC emulation
 
-| Scenario | What changes | Intent |
-|----------|--------------|--------|
-| `stable` | healthy gains `[0.05, 200, 2e-5]`, constant load | baseline / calibration source |
-| `transient` | load steps 10→5 Ω @ 50 ms, back @ 120 ms | brief excursion the detector must *not* alarm on |
-| `ringing` | `Kd` removed, `Ki=80` + same load steps | poorly damped but still stable |
-| `growing` | healthy → marginal gains ramped 30–130 ms | slowly lost damping → early-warning test |
-| `oscillation` | healthy → bad gains abruptly at 50 ms | loop goes unstable → full alarm |
+The proposed sensing stage uses a resistor divider to scale output voltage into the ESP32 ADC range.
 
-```bash
-octave buck_sim.m     # writes data/*.csv and data/*.png
-```
+- Divider ratio: 0.5
+- 5 V output becomes 2.5 V at the ADC input.
+- Example divider: 10 kΩ + 10 kΩ.
 
----
+The Python ADC emulator performs:
 
-## 2. Sense (signal conditioning)
+1. Moving-average anti-alias filtering.
+2. Sampling at 20 kHz.
+3. Voltage-divider scaling.
+4. Gaussian noise injection at 0.5 LSB RMS.
+5. Clipping to 0–3.3 V.
+6. Quantisation to 12-bit ADC codes (0–4095).
 
-The ESP32 cannot accept `Vout` directly. A resistor divider scales it into the ADC
-range; the emulation uses ratio **0.5**:
+The 20 kHz sampling rate is selected to capture the 300–5000 Hz analysis band.
 
-```text
-V_ADC = 0.5 × Vout        →   5 V maps to 2.5 V
-```
+## 6. ESP32-style data acquisition
 
-(Any `R1/R2` pair with `R2/(R1+R2) = 0.5`, e.g. 10 k/10 k, implements this.)
+The prototype emulates an embedded acquisition pipeline using:
 
-The stage must preserve the **variation** in voltage — ripple and oscillation are
-the signal of interest, not just the 5 V average.
+- 128-sample circular buffer.
+- 20 kHz sampling frequency.
+- 64-sample hop size.
+- 50% overlapping windows.
+- 6.4 ms window duration.
+- 3.2 ms processing interval.
 
----
+Each new sample overwrites the oldest sample in the ring buffer. Every 64 samples, the detector processes a new window.
 
-## 3. ADC emulation
+## 7. Signal processing and feature extraction
 
-`emulate_adc()` in `detector.py` reproduces what firmware would receive:
+For each window, the detector removes the DC component:
 
-1. **Anti-alias** — centred moving average of the 100 kHz source (length 5)
-2. **Sample** at `fs = 20 kHz` (on hardware: a timer / ADC-ready callback)
-3. **Divider** — `V_adc = 0.5 × Vout`
-4. **Noise** — Gaussian, 0.5 LSB RMS
-5. **Clip** to `[0, 3.3 V]`, **quantise** to 12-bit codes (0…4095)
+`x_ac[n] = x[n] - mean(x)`
 
-| ADC setting | Value |
-|-------------|-------|
-| Sampling rate `fs` | 20 kHz |
-| Resolution | 12-bit, 3.3 V full scale |
-| Effective LSB at Vout | ≈ 1.61 mV |
-| Noise | 0.5 LSB RMS (CLI: `--noise-lsb`) |
+It extracts six principal features:
 
-**Why 20 kHz?** The features of interest live around the LC resonance (~1.1–1.4 kHz)
-and the analysis band is 300–5000 Hz. Nyquist requires `fs > 2·f_max` → `fs > 10 kHz`
-to cover the band; 20 kHz gives practical margin (~15× the resonance).
+| Feature | Purpose |
+|---|---|
+| RMS ripple | Measures overall output-voltage fluctuation |
+| Peak-to-peak ripple | Measures maximum waveform excursion |
+| Band RMS | Measures oscillation energy between 300–5000 Hz |
+| Tone RMS | Measures energy around the dominant frequency |
+| Dominant frequency | Identifies the main oscillation frequency |
+| Growth slope | Determines whether RMS ripple is increasing over successive windows |
 
----
+A Hann-windowed FFT is used for frequency-domain analysis.
 
-## 4. Streaming on the ESP32 (circular buffer)
+## 8. Risk assessment
 
-Firmware cannot store an infinite stream, so a **fixed 128-sample ring buffer**
-holds the most recent window (`static float buf[N]; uint16_t head;` in C terms).
-Each new sample overwrites the oldest — no allocation, constant memory.
+The detector calibrates against the stable scenario.
 
-| Windowing | Value | At 20 kHz |
-|-----------|-------|-----------|
-| Window `N` | 128 samples | 6.4 ms |
-| Hop | 64 samples | 3.2 ms (50 % overlap) |
-| FFT bin width `fs/N` | — | 156.25 Hz |
+- Noise floor: mean + 5 standard deviations of baseline RMS/tone RMS.
+- Severe RMS ripple reference: 3% of 5 V = 150 mV.
 
-`Detector.on_sample()` runs once per sample (the timer ISR role); every hop it
-calls `process_window()` (the processing task role).
+The normalised features are combined into a risk score:
 
----
+`R = 0.4A + 0.4E + 0.2G`
 
-## 5. Signal processing
+Where:
+- A = amplitude score.
+- E = oscillation-tone energy score.
+- G = ripple growth score.
 
-For each window `x[0…N-1]` (in volts at `Vout`):
+The score ranges from 0 to 1.
 
-**DC removal** — the interesting information is the variation around 5 V:
+## 9. Three-state classification
 
-```text
-x_ac[n] = x[n] − mean(x)
-```
+The detector uses persistence and hysteresis to avoid false alarms and rapid state switching.
 
-Then two time-domain measures and an FFT:
+| Transition | Condition |
+|---|---|
+| NORMAL → WARNING | 4 consecutive windows with risk ≥ 0.20 |
+| WARNING → OSCILLATION | 8 consecutive windows with risk ≥ 0.55 |
+| WARNING → NORMAL | 6 consecutive calm windows with risk below 0.20 |
+| OSCILLATION → WARNING | 6 consecutive windows with risk below 0.55 |
 
-| Feature | Definition | Question it answers |
-|---------|------------|---------------------|
-| RMS ripple | `√(mean(x_ac²))` | How much is the output fluctuating overall? |
-| Peak-to-peak | `max(x_ac) − min(x_ac)` | Total excursion of the waveform |
-| Band RMS | Parseval RMS of FFT bins in **300–5000 Hz** | How much energy is in the oscillation band? |
-| Tone RMS | RMS of peak bin ±2 inside the band | Energy of the single dominant oscillation |
-| Dominant freq. `f_dom` | parabolic interpolation of the band peak | What frequency is the oscillation at? |
-| Growth slope | least-squares slope of `ln(RMS)` over last **5 windows** | Is the ripple getting bigger over time? |
+The detector does not jump directly from NORMAL to OSCILLATION. It passes through WARNING to represent progressive deterioration.
 
-FFT details: Hann window (periodic) before `rfft`; `tonality = tone power / band
-power` is computed for plots (near 1 = one pure tone) but is not part of the risk score.
+### Interpretation of modes
 
-### Switching-frequency caveat
+- **NORMAL:** Output behaviour remains within the calibrated baseline.
+- **WARNING:** Abnormal fluctuations or increasing oscillation risk are detected.
+- **OSCILLATION:** Sustained high-risk oscillatory behaviour is detected.
 
-A real buck switches at `fsw = 100 kHz` and deliberately puts energy there — that
-is **not** a fault. This project watches the **control-loop band (300–5000 Hz)**
-around the LC resonance, far below `fsw`. The averaged simulator removes switching
-ripple entirely, so the detector can never mistake `fsw` for an oscillation; on
-hardware the same separation comes from the band mask (plus the anti-alias filter).
+## 10. Expected classification
 
----
+| Scenario | Expected result |
+|---|---|
+| Stable | NORMAL |
+| Transient | Mostly NORMAL; temporary disturbances should not trigger sustained alarms |
+| Ringing | Visible frequency content, but no sustained OSCILLATION |
+| Growing | WARNING as damping deteriorates |
+| Oscillation | Escalation to OSCILLATION |
 
-## 6. Risk assessment
+## 11. Implementation mapping
 
-### Calibration (from the known-good run)
+| Python prototype | Intended ESP32 implementation |
+|---|---|
+| `emulate_adc()` | Resistor divider + ADC + hardware timer |
+| `CircularBuffer` | Fixed-size 128-sample array |
+| `on_sample()` | Timer ISR / ADC-ready callback |
+| `process_window()` | Periodic DSP task |
+| `extract_features()` | C functions for RMS, peak-to-peak and FFT |
+| `risk_score()` | Embedded risk calculation |
+| `StateMachine` | C enum and switch-case state machine |
+| Console output and plots | OLED, LED, buzzer or serial output |
 
-Before scoring, `detector.py` calibrates on `data/stable.csv` (first 10 ms skipped):
+No actual ESP32 firmware is included yet. The Python implementation is a prototype designed to map onto embedded firmware.
 
-- **Noise-floor gate** = `mean + 5σ` of stable-window RMS / tone RMS → anything
-  below this scores 0 (indistinguishable from ADC + load noise)
-- **"Severe" level** = `3 %` of Vout as RMS ripple → **150 mV** (a design choice,
-  `severe_pct` in config) → score 1
+## 12. Advantages
 
-### Score
+- Detects deteriorating damping before severe oscillations.
+- Combines time-domain and frequency-domain signal analysis.
+- Uses interpretable features rather than machine learning.
+- Uses a fixed-size circular buffer for predictable memory usage.
+- Uses persistence and hysteresis to reduce false alarms.
+- Calibrates risk against a known-good simulated baseline.
 
-Each term is normalised 0…1 on a logarithmic (dB-style) scale — oscillation
-amplitude can change by 100×:
+## 13. Limitations
 
-```text
-A = db_score(RMS ripple)        # amplitude
-E = db_score(tone RMS)          # narrow-band oscillation energy
-G = clip((slope − 0.05)/(0.30 − 0.05), 0, 1)   # growth; only counts if A > 0
+- Entire project is simulation-based.
+- Averaged converter model does not include switching ripple.
+- No physical ADC or sensor measurements.
+- No real-time ESP32 firmware.
+- Fixed thresholds and weights.
+- Only one input-voltage operating point and limited load scenarios.
+- The detector monitors and alerts; it does not stabilise the converter or adjust PWM.
 
-R = 0.4·A + 0.4·E + 0.2·G       # weights sum to 1
-```
+## 14. Future scope
 
-Conceptually: **how large is the ripple + how much of it is one tone + is it growing**.
+- Implement the acquisition and DSP pipeline on an ESP32.
+- Validate detection using a physical buck converter.
+- Add OLED/LED/buzzer alerts for the three states.
+- Extend the monitor into a closed-loop system with corrective PWM control.
+- Explore adaptive thresholds and machine-learning-based classification.
 
-### State machine (persistence + hysteresis)
+## 15. Important distinction: P&O vs this project
 
-| From | To | Condition |
-|------|----|-----------|
-| NORMAL | WARNING | **4** consecutive windows with `R ≥ 0.20` (~13 ms) |
-| WARNING | OSCILLATION | **8** consecutive windows with `R ≥ 0.55` (~26 ms) |
-| WARNING | NORMAL | **6** consecutive calm windows (`R < 0.20`) |
-| OSCILLATION | WARNING | **6** consecutive windows with `R < 0.55` |
+Perturb & Observe (P&O) is an MPPT algorithm that adjusts converter duty cycle to maximise photovoltaic power.
 
-Persistence means a single load transient (a few excited windows that die away)
-does not raise an alarm; hysteresis (different up/down thresholds + separate calm
-counters) stops the state from flickering. Escalation always passes through
-`WARNING` — real systems degrade before they fully oscillate, and that intermediate
-state is the early warning.
+It is **not the algorithm used in this project**.
 
-### What "predictive" means here
+This project uses signal processing, a weighted risk score and a three-state classification machine to detect regulator instability.
 
-```text
-NORMAL → ripple growing → tone energy rising → WARNING → persistent oscillation → OSCILLATION
-```
-
-The system flags **increasing abnormal behaviour before ripple becomes severe**.
-The detector prints a **lead time**: `severe@ − first WARNING` (positive = warning
-came first). It does **not** predict "failure in N seconds."
-
----
-
-## 7. Expected behaviour per scenario
-
-| Scenario | Expected classification |
-|----------|-------------------------|
-| `stable` | stays `NORMAL` |
-| `transient` | brief activity absorbed by the 4-window persistence → mostly `NORMAL` |
-| `ringing` | tone visible, risk may approach threshold, no sustained `OSCILLATION` |
-| `growing` | `WARNING` during the 30–130 ms damping ramp (growth + amplitude terms) |
-| `oscillation` | escalates to `OSCILLATION` after 8 windows ≥ 0.55 risk from 50 ms on |
-
-Note: mean voltage can stay ≈ 5 V even while oscillating — DC measurement alone
-cannot detect this; that is why frequency-domain and trend features exist.
-
----
-
-## Running the detector
-
-```bash
-python -m venv venv && source venv/bin/activate
-pip install numpy scipy matplotlib
-
-python detector.py                 # all five scenarios → results/*.png
-python detector.py --file data/growing.csv
-python detector.py --noise-lsb 1.5 # noisier ADC
-python detector.py --fs 10000      # try a different sampling rate
-python detector.py --no-show       # save figures only
-```
-
-Console output per scenario: % time in each state, first `WARNING` / first
-`OSCILLATION` time, `severe@` reference, **lead**, median alarm frequency
-(`f_alarm`), and final state.
-
-Figures written to `results/`:
-
-- `<name>_detector.png` — waveform + state colour bands, per-window FFT spectrogram
-  with dominant-frequency track and band markers, log-scale features with the
-  calibrated noise-floor gate, risk score with `r_warn` / `r_osc` lines
-- `<name>_spectrum.png` — spectrum of the highest-risk window
-
-Every tunable threshold lives in `ADCConfig` / `DetectorConfig` at the top of
-`detector.py` — nothing is hidden in the algorithm body.
-
----
-
-## Mapping to embedded firmware
-
-| Prototype code | ESP32 equivalent |
-|----------------|------------------|
-| `emulate_adc()` | resistor divider + ADC + hardware timer at `fs` |
-| `CircularBuffer` | `static float buf[128]; uint16_t head;` |
-| `on_sample()` loop | timer ISR / ADC-ready callback |
-| `process_window()` | periodic DSP task every hop |
-| `extract_features()` | one C function: mean, RMS, p-p, real FFT |
-| `risk_score()` | a few multiplies + `logf` |
-| `StateMachine` | `enum` + `switch` |
-| prints / PNGs | OLED / LED / buzzer / serial |
-
-The Python code is structured so each block can be translated 1:1 into firmware.
-No ESP32 firmware is included yet — the prototype defines the algorithm and its
-memory/timing budget (128-sample window, ~61 windows per 200 ms record).
-
----
-
-## Advantages
-
-- Early warning of deteriorating damping **before** ripple becomes severe
-- Combines time-domain (RMS, p-p, trend) and frequency-domain (band/tone FFT) evidence
-- Constant memory and MCU-friendly math (ring buffer, 128-point FFT, slope over 5 points)
-- Threshold-based and interpretable — no machine learning required
-- Calibrated against a known-good baseline (automatic noise-floor gating)
-
-## Applications
-
-- DC-DC converter health monitoring
-- Embedded power-management systems
-- Battery-powered and automotive electronics
-- Distributed power systems / supply health assessment
-
-## Limitations
-
-- **Simulated only** — averaged model, no ESR/ESL, no component tolerances, no hardware ADC effects beyond quantisation + Gaussian noise
-- Single operating point (12 V → 5 V, one load profile); input-voltage disturbances are not simulated
-- Fixed thresholds and weights; severe level is a design choice, not a specification
-- No phase-margin measurement in the detector — damping is created by gain scheduling and checked offline via closed-loop poles
-- No closed-loop control action: the system **monitors and alerts**, it does not stabilize
-
-## Future scope
-
-- Real-time ESP32 firmware (divider → ADC timer → ISR ring buffer → FFT task → OLED/alert)
-- Hardware validation against a physical buck board
-- Closed-loop extension: `SENSE → ANALYZE → PREDICT → CONTROL → PWM adjustment → REGULATOR`
-- Adaptive / learned thresholds (machine learning) on top of the same feature vector
-- Multi-rail and input-voltage disturbance scenarios
+Do not mix the solar MPPT boost-converter project with this buck-converter oscillation detector in the presentation.
