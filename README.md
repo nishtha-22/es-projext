@@ -2,6 +2,11 @@
 
 A simulation-driven project for detecting developing oscillatory behaviour in switching power regulators using waveform analysis, frequency-domain features and a multi-stage risk classification system.
 
+[!NOTE]
+The experiment was performed in 9W warm yellow light bulb to simulate constant energy input in electrovoltaic cell.
+![setup](assets/sirt.png)
+![arduino-cli p&o output](assets/sirt-term.png)
+
 The repository contains:
 - A GNU Octave averaged buck converter simulator.
 - A Python-based oscillation detection prototype.
